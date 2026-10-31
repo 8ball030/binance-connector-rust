@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use flate2::read::ZlibDecoder;
-use futures::{SinkExt, StreamExt, future::try_join_all, stream::FuturesUnordered};
+use futures::{
+    Sink, SinkExt, Stream, StreamExt, future::try_join_all, ready, stream::FuturesUnordered,
+};
 use http::header::USER_AGENT;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -9,14 +11,15 @@ use std::{
     io::Read,
     marker::PhantomData,
     mem::take,
+    pin::Pin,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
-    net::TcpStream,
     select, spawn,
     sync::{
         Mutex, Notify,
@@ -28,16 +31,12 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-    tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
-    },
-};
 use tokio_util::{sync::CancellationToken, time::DelayQueue};
 use tracing::{debug, error, info, warn};
+use url::Url;
+use yawc::{
+    Frame, HttpRequest, OpCode, Options, TcpWebSocket, WebSocket, WebSocketError, close::CloseCode,
+};
 
 use super::{
     config::{
@@ -52,7 +51,44 @@ use super::{
     },
 };
 
-pub type WebSocketClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type WebSocketClient = TcpWebSocket;
+
+/// Matches tungstenite's default `max_frame_size`, the limit this SDK had before;
+/// yawc's own default is 1 MiB, which large WebSocket API responses exceed.
+const MAX_PAYLOAD_READ: usize = 16 << 20;
+
+/// yawc's own `Stream` ends on a read error without yielding it. The reader
+/// classifies that error to decide whether to reconnect, so read through
+/// `poll_next_frame`, which returns it.
+struct FrameResults(WebSocketClient);
+
+impl Stream for FrameResults {
+    type Item = yawc::Result<Frame>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(Some(ready!(self.get_mut().0.poll_next_frame(cx))))
+    }
+}
+
+impl Sink<Frame> for FrameResults {
+    type Error = WebSocketError;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<yawc::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Frame) -> yawc::Result<()> {
+        Pin::new(&mut self.get_mut().0).start_send(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<yawc::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<yawc::Result<()>> {
+        Pin::new(&mut self.get_mut().0).poll_close(cx)
+    }
+}
 
 const MAX_CONN_DURATION: Duration = Duration::from_secs(23 * 60 * 60);
 const SIGNED_STREAMS_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -263,7 +299,7 @@ pub struct WebsocketConnectionState {
     pub session_logon_req: Option<WebsocketSessionLogonReq>,
     pub url_path: Option<String>,
     pub handler: Option<Arc<dyn WebsocketHandler>>,
-    pub ws_write_tx: Option<UnboundedSender<Message>>,
+    pub ws_write_tx: Option<UnboundedSender<Frame>>,
     pub ws_writer_cancel: Option<CancellationToken>,
 }
 
@@ -299,7 +335,7 @@ impl WebsocketConnectionState {
         }
     }
 
-    fn is_current_writer(&self, writer: &UnboundedSender<Message>) -> bool {
+    fn is_current_writer(&self, writer: &UnboundedSender<Frame>) -> bool {
         self.ws_write_tx
             .as_ref()
             .is_some_and(|current| current.same_channel(writer))
@@ -307,7 +343,7 @@ impl WebsocketConnectionState {
 
     fn begin_reconnect(
         &mut self,
-        writer: &UnboundedSender<Message>,
+        writer: &UnboundedSender<Frame>,
         failure_reason: WebsocketConnectionFailureReason,
     ) -> ReconnectDisposition {
         if !self.is_current_writer(writer) {
@@ -355,7 +391,7 @@ struct ReconnectEntry {
     url: String,
     is_renewal: bool,
     attempt: u32,
-    expected_writer: Option<WeakUnboundedSender<Message>>,
+    expected_writer: Option<WeakUnboundedSender<Frame>>,
 }
 
 impl ReconnectEntry {
@@ -902,7 +938,7 @@ impl WebsocketCommon {
     /// `Ok(())` if connection closes successfully, otherwise a `WebsocketError`
     async fn close_connection_gracefully(
         &self,
-        ws_write_tx_to_close: UnboundedSender<Message>,
+        ws_write_tx_to_close: UnboundedSender<Frame>,
         connection: Arc<WebsocketConnection>,
     ) -> Result<(), WebsocketError> {
         debug!("Waiting for pending requests to complete before disconnecting.");
@@ -925,10 +961,7 @@ impl WebsocketCommon {
         }
 
         info!("Closing WebSocket connection for {}", connection.id);
-        let _ = ws_write_tx_to_close.send(Message::Close(Some(CloseFrame {
-            code: CloseCode::Normal,
-            reason: "".into(),
-        })));
+        let _ = ws_write_tx_to_close.send(Frame::close(CloseCode::Normal, b""));
 
         Ok(())
     }
@@ -991,7 +1024,7 @@ impl WebsocketCommon {
         &self,
         url: String,
         connection: Arc<WebsocketConnection>,
-        old_ws_writer: Option<UnboundedSender<Message>>,
+        old_ws_writer: Option<UnboundedSender<Frame>>,
     ) {
         if let Some(handler) = {
             let conn_state = connection.state.lock().await;
@@ -1095,7 +1128,7 @@ impl WebsocketCommon {
         agent: Option<AgentConnector>,
         user_agent: Option<String>,
         handshake: Option<WebsocketHandshakeFn>,
-    ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, WebsocketError> {
+    ) -> Result<WebSocketClient, WebsocketError> {
         Self::create_websocket_with_headers(url, agent, user_agent, handshake, Vec::new()).await
     }
 
@@ -1112,13 +1145,17 @@ impl WebsocketCommon {
         user_agent: Option<String>,
         handshake: Option<WebsocketHandshakeFn>,
         extra_headers: Vec<(String, String)>,
-    ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, WebsocketError> {
-        let mut req = url
-            .into_client_request()
-            .map_err(|e| WebsocketError::Handshake(e.to_string()))?;
+    ) -> Result<WebSocketClient, WebsocketError> {
+        let parsed_url: Url = url
+            .parse()
+            .map_err(|e: url::ParseError| WebsocketError::Handshake(e.to_string()))?;
+
+        let mut req = HttpRequest::builder();
 
         if let Some(ua) = user_agent {
-            req.headers_mut().insert(USER_AGENT, ua.parse().unwrap());
+            let ua = http::header::HeaderValue::from_str(&ua)
+                .map_err(|e| WebsocketError::Handshake(e.to_string()))?;
+            req = req.header(USER_AGENT, ua);
         }
 
         for (name, value) in extra_headers {
@@ -1126,26 +1163,30 @@ impl WebsocketCommon {
                 .map_err(|e| WebsocketError::Handshake(e.to_string()))?;
             let header_value = http::header::HeaderValue::from_str(&value)
                 .map_err(|e| WebsocketError::Handshake(e.to_string()))?;
-            req.headers_mut().insert(header_name, header_value);
+            req = req.header(header_name, header_value);
         }
 
-        let ws_config: Option<WebSocketConfig> = None;
-        let disable_nagle = false;
+        let options = Options::default()
+            .with_max_payload_read(MAX_PAYLOAD_READ)
+            .with_utf8();
 
         let timeout_duration = Duration::from_secs(10);
         let connector = agent.map(|agent| agent.0);
         let handshake = match handshake {
-            Some(handshake) => handshake(req, ws_config, disable_nagle, connector),
-            None => Box::pin(connect_async_tls_with_config(
-                req,
-                ws_config,
-                disable_nagle,
-                connector,
-            )),
+            Some(handshake) => handshake(parsed_url, req, options, connector),
+            None => Box::pin(async move {
+                let builder = WebSocket::connect(parsed_url)
+                    .with_request(req)
+                    .with_options(options);
+                match connector {
+                    Some(connector) => builder.with_connector(connector).await,
+                    None => builder.await,
+                }
+            }),
         };
         match timeout(timeout_duration, handshake).await {
-            Ok(Ok((ws_stream, response))) => {
-                debug!("WebSocket connected: {:?}", response);
+            Ok(Ok(ws_stream)) => {
+                debug!("WebSocket connected to {}", url);
                 Ok(ws_stream)
             }
             Ok(Err(e)) => {
@@ -1296,8 +1337,8 @@ impl WebsocketCommon {
             error!("Failed to schedule renewal for {}: {:?}", conn.id, e);
         }
 
-        let (write_half, mut read_half) = ws.split();
-        let (tx, mut rx) = unbounded_channel::<Message>();
+        let (write_half, mut read_half) = FrameResults(ws).split();
+        let (tx, mut rx) = unbounded_channel::<Frame>();
         let writer_cancel = CancellationToken::new();
 
         let old_writer = {
@@ -1332,7 +1373,7 @@ impl WebsocketCommon {
                     // Nothing is sent after a Close frame. Exiting here also matters for
                     // freeing the client: the sender for `rx` lives in the connection
                     // state, which this task keeps alive, so `rx` would never close.
-                    let is_close = matches!(msg, Message::Close(_));
+                    let is_close = msg.opcode() == OpCode::Close;
                     // A send blocked on a stalled socket must not outlive the socket.
                     let sent = select! {
                         biased;
@@ -1344,7 +1385,7 @@ impl WebsocketCommon {
                     };
                     if let Err(e) = sent {
                         let failure_reason =
-                            WebsocketConnectionFailureReason::from_tungstenite_error(&e);
+                            WebsocketConnectionFailureReason::from_websocket_error(&e);
 
                         error!(
                             "Write error on {}: {:?}, classified as {:?}",
@@ -1421,13 +1462,14 @@ impl WebsocketCommon {
                 let mut stream_end_reason = None;
                 while let Some(item) = read_half.next().await {
                     match item {
-                        Ok(Message::Text(msg)) => {
+                        // Text frames are UTF-8 validated by yawc (`Options::with_utf8`).
+                        Ok(frame) if frame.opcode() == OpCode::Text => {
                             common
-                                .on_message(msg.to_string(), Arc::clone(&reader_conn))
+                                .on_message(frame.as_str().to_owned(), Arc::clone(&reader_conn))
                                 .await;
                         }
-                        Ok(Message::Binary(bin)) => {
-                            let mut decoder = ZlibDecoder::new(&bin[..]);
+                        Ok(frame) if frame.opcode() == OpCode::Binary => {
+                            let mut decoder = ZlibDecoder::new(&frame.payload()[..]);
                             let mut decompressed = String::new();
                             if let Err(err) = decoder.read_to_string(&mut decompressed) {
                                 error!("Binary message decompress failed: {:?}", err);
@@ -1437,26 +1479,23 @@ impl WebsocketCommon {
                                 .on_message(decompressed, Arc::clone(&reader_conn))
                                 .await;
                         }
-                        Ok(Message::Ping(payload)) => {
+                        // yawc answers pings itself and still hands the frame up.
+                        Ok(frame) if frame.opcode() == OpCode::Ping => {
                             info!("PING received from server on {}", reader_conn.id);
                             common.events.emit(&WebsocketEvent::Ping);
-                            if let Some(tx) = reader_conn.state.lock().await.ws_write_tx.clone() {
-                                let _ = tx.send(Message::Pong(payload));
-                                info!(
-                                    "Responded PONG to server's PING message on {}",
-                                    reader_conn.id
-                                );
-                            }
                         }
-                        Ok(Message::Pong(_)) => {
+                        Ok(frame) if frame.opcode() == OpCode::Pong => {
                             info!("Received PONG from server on {}", reader_conn.id);
                             common.events.emit(&WebsocketEvent::Pong);
                         }
-                        Ok(Message::Close(frame)) => {
-                            let (code, reason) = frame
-                                .map_or((1000, String::new()), |CloseFrame { code, reason }| {
-                                    (code.into(), reason.to_string())
-                                });
+                        Ok(frame) if frame.opcode() == OpCode::Close => {
+                            let code = frame.close_code().map_or(1000, u16::from);
+                            let reason = frame
+                                .close_reason()
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                                .to_owned();
                             common
                                 .events
                                 .emit(&WebsocketEvent::Close(code, reason.clone()));
@@ -1525,7 +1564,7 @@ impl WebsocketCommon {
                         Err(e) => {
                             // Classify the error type for reconnection decision
                             let failure_reason =
-                                WebsocketConnectionFailureReason::from_tungstenite_error(&e);
+                                WebsocketConnectionFailureReason::from_websocket_error(&e);
 
                             stream_end_reason = Some(failure_reason);
                             error!(
@@ -1717,10 +1756,7 @@ impl WebsocketCommon {
             state.reconnection_pending = false;
             state.is_session_logged_on = false;
             if let Some(tx) = state.ws_write_tx.take() {
-                let _ = tx.send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Normal,
-                    reason: "".into(),
-                })));
+                let _ = tx.send(Frame::close(CloseCode::Normal, b""));
             }
         }
 
@@ -1772,7 +1808,7 @@ impl WebsocketCommon {
         for (id, ws_write_tx_opt) in ready {
             if let Some(tx) = ws_write_tx_opt {
                 tasks.push(async move {
-                    if let Err(e) = tx.send(Message::Ping(Vec::new().into())) {
+                    if let Err(e) = tx.send(Frame::ping(Vec::new())) {
                         error!("Failed to send PING to {}: {:?}", id, e);
                     } else {
                         debug!("Sent PING to connection {}", id);
@@ -1851,10 +1887,7 @@ impl WebsocketCommon {
 
         debug!("Sending message to WebSocket on connection {}", conn.id);
 
-        if ws_write_tx
-            .send(Message::Text(payload.clone().into()))
-            .is_err()
-        {
+        if ws_write_tx.send(Frame::text(payload.clone())).is_err() {
             if let Some((request_id, _)) = &pending_setup {
                 let mut conn_state = conn.state.lock().await;
                 conn_state.pending_requests.remove(request_id);
@@ -2830,7 +2863,7 @@ impl WebsocketStreams {
                     break;
                 }
 
-                if writer.send(Message::Ping(Vec::new().into())).is_err() {
+                if writer.send(Frame::ping(Vec::new())).is_err() {
                     break;
                 }
                 debug!("PING sent to connection {}", conn.id);
@@ -3764,6 +3797,11 @@ mod tests {
         },
     };
     use tungstenite::handshake::server::Request;
+    use yawc::{Frame, OpCode};
+
+    fn text(frame: &Frame) -> Option<String> {
+        (frame.opcode() == OpCode::Text).then(|| frame.as_str().to_owned())
+    }
 
     /// RAII guard that aborts a spawned task when dropped.
     ///
@@ -3817,7 +3855,7 @@ mod tests {
         st.renewal_pending = renewal_pending;
         st.close_initiated = close_initiated;
         if has_writer {
-            let (tx, _) = unbounded_channel::<Message>();
+            let (tx, _) = unbounded_channel::<Frame>();
             st.ws_write_tx = Some(tx);
         } else {
             st.ws_write_tx = None;
@@ -4042,7 +4080,7 @@ mod tests {
                             c.fetch_add(1, Ordering::SeqCst);
                             sleep(Duration::from_millis(100)).await;
                             a.fetch_sub(1, Ordering::SeqCst);
-                            Err(tungstenite::Error::ConnectionClosed)
+                            Err(yawc::WebSocketError::ConnectionClosed)
                         })
                     });
 
@@ -4094,8 +4132,8 @@ mod tests {
                     let (a_release_tx, a_release_rx) = oneshot::channel();
                     let a_release_rx = Arc::new(Mutex::new(Some(a_release_rx)));
 
-                    let handshake: WebsocketHandshakeFn = Arc::new(move |request, _, _, _| {
-                        let path = request.uri().path().to_owned();
+                    let handshake: WebsocketHandshakeFn = Arc::new(move |url, _, _, _| {
+                        let path = url.path().to_owned();
                         let a_started_tx = a_started_tx.clone();
                         let b_started_tx = b_started_tx.clone();
                         let a_release_rx = Arc::clone(&a_release_rx);
@@ -4116,7 +4154,7 @@ mod tests {
                                 }
                                 unexpected => panic!("unexpected reconnect path: {unexpected}"),
                             }
-                            Err(tungstenite::Error::ConnectionClosed)
+                            Err(yawc::WebSocketError::ConnectionClosed)
                         })
                     });
 
@@ -4608,7 +4646,7 @@ mod tests {
                     let conn = WebsocketConnection::new("c-reconnect");
                     {
                         let mut st = conn.state.lock().await;
-                        let (tx, _) = unbounded_channel::<Message>();
+                        let (tx, _) = unbounded_channel::<Frame>();
                         st.ws_write_tx = Some(tx);
                         st.reconnection_pending = true;
                     }
@@ -5043,7 +5081,7 @@ mod tests {
                 pause();
 
                 let conn = WebsocketConnection::new("c1");
-                let (tx, mut rx) = unbounded_channel::<Message>();
+                let (tx, mut rx) = unbounded_channel::<Frame>();
                 let (req_tx, _req_rx) = oneshot::channel();
                 {
                     let mut st = conn.state.lock().await;
@@ -5062,8 +5100,8 @@ mod tests {
                 advance(Duration::from_secs(1)).await;
                 close_fut.await.unwrap();
                 match rx.try_recv() {
-                    Ok(Message::Close(_)) => {}
-                    other => panic!("expected Close, got {other:?}"),
+                    Ok(f) if f.opcode() == OpCode::Close => {}
+                    other => panic!("expected Close, got {:?}", other.map(|f| f.opcode())),
                 }
 
                 resume();
@@ -5074,7 +5112,7 @@ mod tests {
                 pause();
 
                 let conn = WebsocketConnection::new("c2");
-                let (tx, mut rx) = unbounded_channel::<Message>();
+                let (tx, mut rx) = unbounded_channel::<Frame>();
                 let (req_tx, _req_rx) = oneshot::channel();
                 {
                     let mut st = conn.state.lock().await;
@@ -5089,8 +5127,11 @@ mod tests {
                 advance(Duration::from_secs(30)).await;
                 close_fut.await.unwrap();
                 match rx.try_recv() {
-                    Ok(Message::Close(_)) => {}
-                    other => panic!("expected Close on timeout, got {other:?}"),
+                    Ok(f) if f.opcode() == OpCode::Close => {}
+                    other => panic!(
+                        "expected Close on timeout, got {:?}",
+                        other.map(|f| f.opcode())
+                    ),
                 }
 
                 resume();
@@ -5222,7 +5263,7 @@ mod tests {
             fn handles_renewal_pending_and_closes_old_writer() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c2");
-                    let (old_tx, mut old_rx) = unbounded_channel::<Message>();
+                    let (old_tx, mut old_rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.renewal_pending = true;
@@ -5239,8 +5280,8 @@ mod tests {
                         .await;
                     assert!(!conn.state.lock().await.renewal_pending);
                     match old_rx.try_recv() {
-                        Ok(Message::Close(_)) => {}
-                        other => panic!("expected Close, got {other:?}"),
+                        Ok(f) if f.opcode() == OpCode::Close => {}
+                        other => panic!("expected Close, got {:?}", other.map(|f| f.opcode())),
                     }
                 });
             }
@@ -5428,7 +5469,7 @@ mod tests {
             #[test]
             fn configuration_builders_accept_custom_handshakes() {
                 let handshake: WebsocketHandshakeFn = Arc::new(|_, _, _, _| {
-                    Box::pin(async { Err(tungstenite::Error::ConnectionClosed) })
+                    Box::pin(async { Err(yawc::WebSocketError::ConnectionClosed) })
                 });
 
                 let api = ConfigurationWebsocketApi::builder()
@@ -5515,19 +5556,16 @@ mod tests {
                     let handshake_calls = Arc::new(AtomicUsize::new(0));
                     let handshake_calls_clone = Arc::clone(&handshake_calls);
                     let handshake: WebsocketHandshakeFn =
-                        Arc::new(move |mut request, ws_config, disable_nagle, connector| {
+                        Arc::new(move |_url, request, options, _connector| {
                             let handshake_calls = Arc::clone(&handshake_calls_clone);
                             Box::pin(async move {
                                 handshake_calls.fetch_add(1, Ordering::SeqCst);
                                 // Redirect the transport target to the relay.
-                                *request.uri_mut() = format!("ws://{relay_addr}/").parse().unwrap();
-                                tokio_tungstenite::connect_async_tls_with_config(
-                                    request,
-                                    ws_config,
-                                    disable_nagle,
-                                    connector,
-                                )
-                                .await
+                                let relay_url = format!("ws://{relay_addr}/").parse().unwrap();
+                                yawc::WebSocket::connect(relay_url)
+                                    .with_request(request)
+                                    .with_options(options)
+                                    .await
                             })
                         });
 
@@ -5546,19 +5584,15 @@ mod tests {
                     // 5. Exchange a real message round-trip over the tunneled
                     //    connection and verify it reached the echo origin.
                     let (mut write, mut read) = ws.split();
-                    write
-                        .send(Message::Text("through-tunnel".into()))
-                        .await
-                        .unwrap();
+                    write.send(Frame::text("through-tunnel")).await.unwrap();
                     let reply = timeout(Duration::from_secs(5), read.next())
                         .await
                         .expect("timed out awaiting echo")
-                        .expect("stream ended")
-                        .expect("read error");
+                        .expect("stream ended");
 
                     assert_eq!(
-                        reply,
-                        Message::Text("echo:through-tunnel".into()),
+                        (reply.opcode(), reply.as_str()),
+                        (OpCode::Text, "echo:through-tunnel"),
                         "message did not round-trip through the origin"
                     );
                     assert_eq!(
@@ -5582,20 +5616,15 @@ mod tests {
                     let handshake_calls = Arc::new(AtomicUsize::new(0));
                     let handshake_calls_clone = Arc::clone(&handshake_calls);
                     let handshake: WebsocketHandshakeFn =
-                        Arc::new(move |request, config, disable_nagle, connector| {
+                        Arc::new(move |url, request, options, connector| {
                             let handshake_calls = Arc::clone(&handshake_calls_clone);
                             Box::pin(async move {
                                 handshake_calls.fetch_add(1, Ordering::SeqCst);
-                                assert!(config.is_none());
-                                assert!(!disable_nagle);
                                 assert!(connector.is_none());
-                                tokio_tungstenite::connect_async_tls_with_config(
-                                    request,
-                                    config,
-                                    disable_nagle,
-                                    connector,
-                                )
-                                .await
+                                yawc::WebSocket::connect(url)
+                                    .with_request(request)
+                                    .with_options(options)
+                                    .await
                             })
                         });
 
@@ -5607,7 +5636,11 @@ mod tests {
                     )
                     .await;
 
-                    assert!(result.is_ok(), "custom handshake failed: {result:?}");
+                    assert!(
+                        result.is_ok(),
+                        "custom handshake failed: {:?}",
+                        result.as_ref().err()
+                    );
                     assert_eq!(handshake_calls.load(Ordering::SeqCst), 1);
                 });
             }
@@ -5621,7 +5654,7 @@ mod tests {
                         let handshake_calls = Arc::clone(&handshake_calls_clone);
                         Box::pin(async move {
                             handshake_calls.fetch_add(1, Ordering::SeqCst);
-                            Err(tungstenite::Error::ConnectionClosed)
+                            Err(yawc::WebSocketError::ConnectionClosed)
                         })
                     });
 
@@ -5667,7 +5700,7 @@ mod tests {
                     let res =
                         WebsocketCommon::create_websocket(&url, None, Some(expected_ua), None)
                             .await;
-                    assert!(res.is_ok(), "handshake failed: {res:?}");
+                    assert!(res.is_ok(), "handshake failed: {:?}", res.as_ref().err());
                 });
             }
 
@@ -5957,8 +5990,8 @@ mod tests {
                         None,
                         Some(counting_handshake(calls.clone(), vec![])),
                     );
-                    let (old_tx, _old_rx) = unbounded_channel::<Message>();
-                    let (newer_tx, _newer_rx) = unbounded_channel::<Message>();
+                    let (old_tx, _old_rx) = unbounded_channel::<Frame>();
+                    let (newer_tx, _newer_rx) = unbounded_channel::<Frame>();
                     conn.state.lock().await.ws_write_tx = Some(newer_tx.clone());
 
                     // A renewal retry for the old socket that was enqueued just before
@@ -5995,7 +6028,7 @@ mod tests {
                     None,
                     Some(counting_handshake(calls.clone(), (1..100).collect())),
                 );
-                let (old_tx, _old_rx) = unbounded_channel::<Message>();
+                let (old_tx, _old_rx) = unbounded_channel::<Frame>();
                 conn.state.lock().await.ws_write_tx = Some(old_tx);
                 common
                     .schedule_reconnect_retry(
@@ -6022,10 +6055,10 @@ mod tests {
 
             #[test]
             fn reconnect_entry_staleness_rules() {
-                let (current, _rx) = unbounded_channel::<Message>();
-                let (other, _rx2) = unbounded_channel::<Message>();
+                let (current, _rx) = unbounded_channel::<Frame>();
+                let (other, _rx2) = unbounded_channel::<Frame>();
                 let entry =
-                    |is_renewal, expected: Option<&UnboundedSender<Message>>| ReconnectEntry {
+                    |is_renewal, expected: Option<&UnboundedSender<Frame>>| ReconnectEntry {
                         connection_id: "c".into(),
                         url: "u".into(),
                         is_renewal,
@@ -6076,7 +6109,7 @@ mod tests {
 
                     let chunk = "x".repeat(1 << 20);
                     for _ in 0..64 {
-                        writer.send(Message::Text(chunk.clone().into())).unwrap();
+                        writer.send(Frame::text(chunk.clone())).unwrap();
                     }
                     // Give the writer time to fill the socket buffers and block.
                     sleep(Duration::from_millis(300)).await;
@@ -6119,7 +6152,7 @@ mod tests {
                     Some(counting_handshake(calls.clone(), vec![1])),
                 );
 
-                let (old_tx, _old_rx) = unbounded_channel::<Message>();
+                let (old_tx, _old_rx) = unbounded_channel::<Frame>();
                 conn.state.lock().await.ws_write_tx = Some(old_tx);
                 common
                     .schedule_reconnect_retry(
@@ -6136,7 +6169,7 @@ mod tests {
 
                 tokio::task::yield_now().await;
 
-                let (newer_writer, _newer_rx) = unbounded_channel::<Message>();
+                let (newer_writer, _newer_rx) = unbounded_channel::<Frame>();
                 {
                     let mut state = conn.state.lock().await;
                     state.ws_write_tx = Some(newer_writer);
@@ -6162,23 +6195,20 @@ mod tests {
                 calls: Arc<AtomicUsize>,
                 fail_on: Vec<usize>,
             ) -> WebsocketHandshakeFn {
-                Arc::new(move |request, config, disable_nagle, connector| {
+                Arc::new(move |url, request, options, _connector| {
                     let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     let fail = fail_on.contains(&attempt);
                     Box::pin(async move {
                         if fail {
-                            return Err(tungstenite::Error::Io(std::io::Error::new(
+                            return Err(yawc::WebSocketError::IoError(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionRefused,
                                 "injected handshake failure",
                             )));
                         }
-                        tokio_tungstenite::connect_async_tls_with_config(
-                            request,
-                            config,
-                            disable_nagle,
-                            connector,
-                        )
-                        .await
+                        yawc::WebSocket::connect(url)
+                            .with_request(request)
+                            .with_options(options)
+                            .await
                     })
                 })
             }
@@ -6403,7 +6433,7 @@ mod tests {
                         Some(counting_handshake(calls.clone(), vec![1])),
                     );
 
-                    let (old_tx, _old_rx) = unbounded_channel::<Message>();
+                    let (old_tx, _old_rx) = unbounded_channel::<Frame>();
                     conn.state.lock().await.ws_write_tx = Some(old_tx.clone());
 
                     common
@@ -6492,7 +6522,7 @@ mod tests {
                         ReconnectDisposition::Started,
                     );
 
-                    writer.send(Message::Text("after-reconnect".into())).unwrap();
+                    writer.send(Frame::text("after-reconnect")).unwrap();
                     let post_reconnect = timeout(Duration::from_secs(1), post_reconnect_rx)
                         .await
                         .expect("server did not finish observing the connection")
@@ -6534,8 +6564,8 @@ mod tests {
 
             #[test]
             fn reconnect_state_requires_current_writer_and_open_lifecycle() {
-                let (current_writer, _) = unbounded_channel::<Message>();
-                let (replaced_writer, _) = unbounded_channel::<Message>();
+                let (current_writer, _) = unbounded_channel::<Frame>();
+                let (replaced_writer, _) = unbounded_channel::<Frame>();
                 let mut state = WebsocketConnectionState::new();
                 state.ws_write_tx = Some(current_writer.clone());
 
@@ -6651,7 +6681,7 @@ mod tests {
                         .unwrap();
 
                     let tx = conn.state.lock().await.ws_write_tx.clone().unwrap();
-                    tx.send(Message::Text("ping".into())).unwrap();
+                    tx.send(Frame::text("ping")).unwrap();
 
                     sleep(Duration::from_millis(50)).await;
 
@@ -6670,7 +6700,7 @@ mod tests {
                     let conn = WebsocketConnection::new("c-reconnect");
                     {
                         let mut st = conn.state.lock().await;
-                        let (tx, _) = unbounded_channel::<Message>();
+                        let (tx, _) = unbounded_channel::<Frame>();
                         st.ws_write_tx = Some(tx);
                         st.reconnection_pending = true;
                     }
@@ -6768,7 +6798,7 @@ mod tests {
             fn skip_if_writer_exists_and_not_renewal() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c-writer");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx.clone());
@@ -7290,8 +7320,8 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn1 = WebsocketConnection::new("c1");
                     let conn2 = WebsocketConnection::new("c2");
-                    let (tx1, mut rx1) = unbounded_channel::<Message>();
-                    let (tx2, mut rx2) = unbounded_channel::<Message>();
+                    let (tx1, mut rx1) = unbounded_channel::<Frame>();
+                    let (tx2, mut rx2) = unbounded_channel::<Frame>();
                     {
                         let mut s1 = conn1.state.lock().await;
                         s1.ws_write_tx = Some(tx1);
@@ -7328,8 +7358,12 @@ mod tests {
                     }
 
                     match (rx1.try_recv(), rx2.try_recv()) {
-                        (Ok(Message::Close(_)), Ok(Message::Close(_))) => {}
-                        other => panic!("expected two Close frames, got {other:?}"),
+                        (Ok(a), Ok(b))
+                            if a.opcode() == OpCode::Close && b.opcode() == OpCode::Close => {}
+                        other => panic!(
+                            "expected two Close frames, got {:?}",
+                            (other.0.map(|f| f.opcode()), other.1.map(|f| f.opcode()))
+                        ),
                     }
                 });
             }
@@ -7356,7 +7390,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn_w = WebsocketConnection::new("with");
                     let conn_wo = WebsocketConnection::new("without");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn_w.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7376,7 +7410,7 @@ mod tests {
 
                     assert!(conn_w.state.lock().await.close_initiated);
                     assert!(conn_wo.state.lock().await.close_initiated);
-                    assert!(matches!(rx.try_recv(), Ok(Message::Close(_))));
+                    assert!(matches!(rx.try_recv(), Ok(f) if f.opcode() == OpCode::Close));
                 });
             }
 
@@ -7384,7 +7418,7 @@ mod tests {
             fn after_disconnect_not_connected() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, mut _rx) = unbounded_channel::<Message>();
+                    let (tx, mut _rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7411,7 +7445,7 @@ mod tests {
                     let mut conns = Vec::new();
                     for i in 0..3 {
                         let conn = WebsocketConnection::new(format!("c{i}"));
-                        let (tx, rx) = unbounded_channel::<Message>();
+                        let (tx, rx) = unbounded_channel::<Frame>();
                         {
                             let mut st = conn.state.lock().await;
                             st.ws_write_tx = Some(tx);
@@ -7428,8 +7462,11 @@ mod tests {
                     common.ping_server().await;
                     for (_, mut rx) in conns {
                         match rx.try_recv() {
-                            Ok(Message::Ping(payload)) if payload.is_empty() => {}
-                            other => panic!("expected empty-payload Ping, got {other:?}"),
+                            Ok(f) if f.opcode() == OpCode::Ping && f.payload().is_empty() => {}
+                            other => panic!(
+                                "expected empty-payload Ping, got {:?}",
+                                other.map(|f| f.opcode())
+                            ),
                         }
                     }
                 });
@@ -7440,7 +7477,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let ready = WebsocketConnection::new("ready");
                     let not_ready = WebsocketConnection::new("not-ready");
-                    let (tx_r, mut rx_r) = unbounded_channel::<Message>();
+                    let (tx_r, mut rx_r) = unbounded_channel::<Frame>();
                     {
                         let mut st = ready.state.lock().await;
                         st.ws_write_tx = Some(tx_r);
@@ -7458,8 +7495,11 @@ mod tests {
                     );
                     common.ping_server().await;
                     match rx_r.try_recv() {
-                        Ok(Message::Ping(payload)) if payload.is_empty() => {}
-                        other => panic!("expected Ping on ready, got {other:?}"),
+                        Ok(f) if f.opcode() == OpCode::Ping && f.payload().is_empty() => {}
+                        other => panic!(
+                            "expected Ping on ready, got {:?}",
+                            other.map(|f| f.opcode())
+                        ),
                     }
                 });
             }
@@ -7468,7 +7508,7 @@ mod tests {
             fn no_ping_when_flags_block() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7495,8 +7535,8 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn1 = WebsocketConnection::new("c1");
                     let conn2 = WebsocketConnection::new("c2");
-                    let (tx1, mut rx1) = unbounded_channel::<Message>();
-                    let (tx2, mut rx2) = unbounded_channel::<Message>();
+                    let (tx1, mut rx1) = unbounded_channel::<Frame>();
+                    let (tx2, mut rx2) = unbounded_channel::<Frame>();
                     {
                         let mut s1 = conn1.state.lock().await;
                         s1.ws_write_tx = Some(tx1);
@@ -7526,7 +7566,7 @@ mod tests {
                     assert!(res2.is_none());
 
                     assert_eq!(
-                        if let Message::Text(t) = rx1.try_recv().unwrap() {
+                        if let Some(t) = text(&rx1.try_recv().unwrap()) {
                             t
                         } else {
                             panic!()
@@ -7534,7 +7574,7 @@ mod tests {
                         "a"
                     );
                     assert_eq!(
-                        if let Message::Text(t) = rx2.try_recv().unwrap() {
+                        if let Some(t) = text(&rx2.try_recv().unwrap()) {
                             t
                         } else {
                             panic!()
@@ -7549,7 +7589,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn1 = WebsocketConnection::new("c1");
                     let conn2 = WebsocketConnection::new("c2");
-                    let (tx2, mut rx2) = unbounded_channel::<Message>();
+                    let (tx2, mut rx2) = unbounded_channel::<Frame>();
                     {
                         let mut s1 = conn1.state.lock().await;
                         s1.ws_write_tx = None;
@@ -7571,8 +7611,8 @@ mod tests {
                         .unwrap();
                     assert!(res.is_none());
                     match rx2.try_recv().unwrap() {
-                        Message::Text(t) => assert_eq!(t, "bar"),
-                        other => panic!("unexpected {other:?}"),
+                        f if f.opcode() == OpCode::Text => assert_eq!(f.as_str(), "bar"),
+                        other => panic!("unexpected {:?}", other.opcode()),
                     }
                 });
             }
@@ -7582,7 +7622,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn1 = WebsocketConnection::new("c1");
                     let conn2 = WebsocketConnection::new("c2");
-                    let (tx2, mut rx2) = unbounded_channel::<Message>();
+                    let (tx2, mut rx2) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn2.state.lock().await;
                         st.ws_write_tx = Some(tx2);
@@ -7606,8 +7646,8 @@ mod tests {
                         .unwrap();
                     assert!(res.is_none());
                     match rx2.try_recv() {
-                        Ok(Message::Text(t)) => assert_eq!(t, "payload"),
-                        other => panic!("expected Text, got {other:?}"),
+                        Ok(f) if f.opcode() == OpCode::Text => assert_eq!(f.as_str(), "payload"),
+                        other => panic!("expected Text, got {:?}", other.map(|f| f.opcode())),
                     }
                 });
             }
@@ -7616,7 +7656,7 @@ mod tests {
             fn sync_send_with_id_does_not_insert_pending() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7641,8 +7681,8 @@ mod tests {
                     assert!(res.is_none());
                     assert!(conn.state.lock().await.pending_requests.is_empty());
                     match rx.try_recv().unwrap() {
-                        Message::Text(t) => assert_eq!(t, "msg"),
-                        other => panic!("unexpected {other:?}"),
+                        f if f.opcode() == OpCode::Text => assert_eq!(f.as_str(), "msg"),
+                        other => panic!("unexpected {:?}", other.opcode()),
                     }
                 });
             }
@@ -7695,7 +7735,7 @@ mod tests {
             fn async_send_and_receive() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7719,8 +7759,8 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     match rx.try_recv() {
-                        Ok(Message::Text(t)) => assert_eq!(t, "hello"),
-                        other => panic!("expected Text, got {other:?}"),
+                        Ok(f) if f.opcode() == OpCode::Text => assert_eq!(f.as_str(), "hello"),
+                        other => panic!("expected Text, got {:?}", other.map(|f| f.opcode())),
                     }
                     {
                         let mut st = conn.state.lock().await;
@@ -7736,7 +7776,7 @@ mod tests {
             fn async_send_default_connection() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7760,7 +7800,7 @@ mod tests {
                         .unwrap()
                         .unwrap();
                     match rx.try_recv() {
-                        Ok(Message::Text(t)) => assert_eq!(t, "msg"),
+                        Ok(f) if f.opcode() == OpCode::Text => assert_eq!(f.as_str(), "msg"),
                         _ => panic!("no text"),
                     }
                     {
@@ -7784,7 +7824,7 @@ mod tests {
                 // future request that reuses the id).
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, rx) = unbounded_channel::<Message>();
+                    let (tx, rx) = unbounded_channel::<Frame>();
                     drop(rx);
                     {
                         let mut st = conn.state.lock().await;
@@ -7819,7 +7859,7 @@ mod tests {
             fn async_send_error_if_no_id() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conn = WebsocketConnection::new("c§");
-                    let (tx, _rx) = unbounded_channel::<Message>();
+                    let (tx, _rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -7850,7 +7890,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     pause();
                     let conn = WebsocketConnection::new("c1");
-                    let (tx, _rx) = unbounded_channel::<Message>();
+                    let (tx, _rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -8143,7 +8183,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let api = create_websocket_api(None, None, None);
                     let conn = &api.common.connection_pool[0];
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -8176,7 +8216,7 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt) = rx.recv().await.unwrap() else {
+                    let Some(txt) = text(&rx.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8209,7 +8249,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let api = create_websocket_api(None, None, None);
                     let conn = &api.common.connection_pool[0];
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -8241,7 +8281,7 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt) = rx.recv().await.unwrap() else {
+                    let Some(txt) = text(&rx.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8271,7 +8311,7 @@ mod tests {
                 TOKIO_SHARED_RT.block_on(async {
                     let api = create_websocket_api(None, None, None);
                     let conn = &api.common.connection_pool[0];
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
@@ -8304,7 +8344,7 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt) = rx.recv().await.unwrap() else {
+                    let Some(txt) = text(&rx.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8337,8 +8377,8 @@ mod tests {
                     let conn0 = &api.common.connection_pool[0];
                     let conn1 = &api.common.connection_pool[1];
 
-                    let (tx0, mut rx0) = unbounded_channel::<Message>();
-                    let (tx1, mut rx1) = unbounded_channel::<Message>();
+                    let (tx0, mut rx0) = unbounded_channel::<Frame>();
+                    let (tx1, mut rx1) = unbounded_channel::<Frame>();
                     {
                         let mut st0 = conn0.state.lock().await;
                         st0.ws_write_tx = Some(tx0);
@@ -8373,10 +8413,10 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt0) = rx0.recv().await.unwrap() else {
+                    let Some(txt0) = text(&rx0.recv().await.unwrap()) else {
                         panic!()
                     };
-                    let Message::Text(txt1) = rx1.recv().await.unwrap() else {
+                    let Some(txt1) = text(&rx1.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req0: Value = serde_json::from_str(&txt0).unwrap();
@@ -8444,7 +8484,7 @@ mod tests {
                     let api = create_websocket_api(None, Some(WebsocketMode::Pool(2)), None);
 
                     for conn in &api.common.connection_pool {
-                        let (tx, _rx) = unbounded_channel::<Message>();
+                        let (tx, _rx) = unbounded_channel::<Frame>();
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
                         st.is_session_logged_on = true;
@@ -8458,7 +8498,7 @@ mod tests {
                     let mut rxs = Vec::new();
                     for conn in &api.common.connection_pool {
                         let rx = {
-                            let (tx, rx) = unbounded_channel::<Message>();
+                            let (tx, rx) = unbounded_channel::<Frame>();
                             conn.state.lock().await.ws_write_tx = Some(tx);
                             rx
                         };
@@ -8491,7 +8531,7 @@ mod tests {
 
                     let mut ids = Vec::new();
                     for mut rx in rxs {
-                        let Message::Text(txt) = rx.recv().await.unwrap() else {
+                        let Some(txt) = text(&rx.recv().await.unwrap()) else {
                             panic!()
                         };
                         let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8533,14 +8573,14 @@ mod tests {
                     let conn = &api.common.connection_pool[0];
                     {
                         let mut st = conn.state.lock().await;
-                        st.ws_write_tx = Some(unbounded_channel::<Message>().0);
+                        st.ws_write_tx = Some(unbounded_channel::<Frame>().0);
                         st.is_session_logged_on = true;
                     }
 
                     let mut rx;
                     {
                         let mut st = conn.state.lock().await;
-                        let (tx, new_rx) = unbounded_channel::<Message>();
+                        let (tx, new_rx) = unbounded_channel::<Frame>();
                         st.ws_write_tx = Some(tx);
                         rx = new_rx;
                     }
@@ -8569,7 +8609,7 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt) = rx.recv().await.unwrap() else {
+                    let Some(txt) = text(&rx.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8601,14 +8641,14 @@ mod tests {
                     let conn = &api.common.connection_pool[0];
                     {
                         let mut st = conn.state.lock().await;
-                        st.ws_write_tx = Some(unbounded_channel::<Message>().0);
+                        st.ws_write_tx = Some(unbounded_channel::<Frame>().0);
                         st.is_session_logged_on = true;
                     }
 
                     let mut rx;
                     {
                         let mut st = conn.state.lock().await;
-                        let (tx, new_rx) = unbounded_channel::<Message>();
+                        let (tx, new_rx) = unbounded_channel::<Frame>();
                         st.ws_write_tx = Some(tx);
                         rx = new_rx;
                     }
@@ -8637,7 +8677,7 @@ mod tests {
                         }
                     });
 
-                    let Message::Text(txt) = rx.recv().await.unwrap() else {
+                    let Some(txt) = text(&rx.recv().await.unwrap()) else {
                         panic!()
                     };
                     let req: Value = serde_json::from_str(&txt).unwrap();
@@ -8773,7 +8813,7 @@ mod tests {
                         },
                     };
 
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.session_logon_req = Some(req.clone());
@@ -8783,7 +8823,7 @@ mod tests {
 
                     api.on_open("wss://example".to_string(), conn.clone()).await;
 
-                    let Message::Text(raw) = rx.recv().await.unwrap() else {
+                    let Some(raw) = text(&rx.recv().await.unwrap()) else {
                         panic!("expected a Text message");
                     };
                     let msg: Value = serde_json::from_str(&raw).unwrap();
@@ -8825,7 +8865,7 @@ mod tests {
                         },
                     };
 
-                    let (tx, mut rx) = unbounded_channel::<Message>();
+                    let (tx, mut rx) = unbounded_channel::<Frame>();
                     {
                         let mut st = conn.state.lock().await;
                         st.session_logon_req = Some(req);
@@ -8885,7 +8925,7 @@ mod tests {
                         let mut st = conn.state.lock().await;
                         st.session_logon_req = None;
                         st.is_session_logged_on = false;
-                        st.ws_write_tx = Some(unbounded_channel::<Message>().0);
+                        st.ws_write_tx = Some(unbounded_channel::<Frame>().0);
                     }
 
                     api.on_open("wss://example".into(), conn.clone()).await;
@@ -9686,7 +9726,7 @@ mod tests {
                     let conn = ws.common.connection_pool[0].clone();
 
                     {
-                        let (tx, _rx) = unbounded_channel::<Message>();
+                        let (tx, _rx) = unbounded_channel::<Frame>();
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
                     }
@@ -9824,7 +9864,7 @@ mod tests {
                     let conn = ws.common.connection_pool[0].clone();
 
                     {
-                        let (tx, _rx) = unbounded_channel::<Message>();
+                        let (tx, _rx) = unbounded_channel::<Frame>();
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
                         st.url_path = Some("path1".to_string());
@@ -9862,7 +9902,7 @@ mod tests {
                     let conn = ws.common.connection_pool[0].clone();
 
                     {
-                        let (tx, _rx) = unbounded_channel::<Message>();
+                        let (tx, _rx) = unbounded_channel::<Frame>();
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
                         st.url_path = Some("path1".to_string());
@@ -9900,7 +9940,7 @@ mod tests {
                     let conn = ws.common.connection_pool[0].clone();
 
                     {
-                        let (tx, _rx) = unbounded_channel::<Message>();
+                        let (tx, _rx) = unbounded_channel::<Frame>();
                         let mut st = conn.state.lock().await;
                         st.ws_write_tx = Some(tx);
                         st.url_path = Some("path1".to_string());
@@ -10497,14 +10537,14 @@ mod tests {
                         id.map(StreamId::from),
                     );
                     let msg = rx.recv().await.expect("no message sent");
-                    if let Message::Text(txt) = msg {
+                    if let Some(txt) = text(&msg) {
                         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
                         assert_eq!(v["method"], "SUBSCRIBE");
                         let id = v["id"].as_str().unwrap();
                         assert_ne!(id, "badid");
                         assert!(Regex::new(r"^[0-9a-fA-F]{32}$").unwrap().is_match(id));
                     } else {
-                        panic!("unexpected message: {msg:?}");
+                        panic!("unexpected message: {:?}", msg.opcode());
                     }
                 });
             }
@@ -10530,7 +10570,7 @@ mod tests {
                     ws.send_subscription_payload(conn, &vec!["x".to_string()], None);
                     let msg2 = rx.recv().await.unwrap();
 
-                    if let Message::Text(txt1) = msg1 {
+                    if let Some(txt1) = text(&msg1) {
                         let v1: serde_json::Value = serde_json::from_str(&txt1).unwrap();
                         assert_eq!(v1["id"], "deadbeefdeadbeefdeadbeefdeadbeef");
                         assert_eq!(
@@ -10541,7 +10581,7 @@ mod tests {
                         panic!()
                     }
 
-                    if let Message::Text(txt2) = msg2 {
+                    if let Some(txt2) = text(&msg2) {
                         let v2: serde_json::Value = serde_json::from_str(&txt2).unwrap();
                         assert_eq!(v2["method"], "SUBSCRIBE");
                         let params = v2["params"].as_array().unwrap();
@@ -10581,7 +10621,7 @@ mod tests {
                     ws.send_subscription_payload(conn, &vec!["x".to_string()], None);
                     let msg2 = rx.recv().await.unwrap();
 
-                    if let Message::Text(txt1) = msg1 {
+                    if let Some(txt1) = text(&msg1) {
                         let v1: serde_json::Value = serde_json::from_str(&txt1).unwrap();
                         assert_eq!(v1["method"], "SUBSCRIBE");
                         assert_eq!(v1["id"].as_u64(), Some(123));
@@ -10593,7 +10633,7 @@ mod tests {
                         panic!("Expected Message::Text for msg1");
                     }
 
-                    if let Message::Text(txt2) = msg2 {
+                    if let Some(txt2) = text(&msg2) {
                         let v2: serde_json::Value = serde_json::from_str(&txt2).unwrap();
                         assert_eq!(v2["method"], "SUBSCRIBE");
 
@@ -10634,7 +10674,7 @@ mod tests {
                     ws.on_open("ws://example.com".to_string(), conn.clone())
                         .await;
                     let msg = rx.recv().await.expect("no subscription sent");
-                    if let Message::Text(txt) = msg {
+                    if let Some(txt) = text(&msg) {
                         let v: Value = serde_json::from_str(&txt).unwrap();
                         assert_eq!(v["method"], "SUBSCRIBE");
                         let params = v["params"].as_array().unwrap();
@@ -10643,7 +10683,7 @@ mod tests {
                             &vec![Value::String("foo".into()), Value::String("bar".into())]
                         );
                     } else {
-                        panic!("unexpected message: {msg:?}");
+                        panic!("unexpected message: {:?}", msg.opcode());
                     }
                     let st_after = conn.state.lock().await;
                     assert!(st_after.pending_subscriptions.is_empty());
@@ -11260,7 +11300,7 @@ mod tests {
                     None,
                 );
 
-                let Message::Text(txt) = rx.recv().await.expect("no message sent") else {
+                let Some(txt) = text(&rx.recv().await.expect("no message sent")) else {
                     panic!("expected text message");
                 };
                 let v: Value = serde_json::from_str(&txt).unwrap();
@@ -11281,7 +11321,7 @@ mod tests {
                 )
                 .await;
 
-                let Message::Text(txt) = rx.recv().await.expect("no message sent") else {
+                let Some(txt) = text(&rx.recv().await.expect("no message sent")) else {
                     panic!("expected text message");
                 };
                 let v: Value = serde_json::from_str(&txt).unwrap();
@@ -11352,7 +11392,7 @@ mod tests {
                 ws.on_open("ws://example.com".to_string(), conn.clone())
                     .await;
 
-                let Message::Text(txt) = rx.recv().await.expect("no message sent") else {
+                let Some(txt) = text(&rx.recv().await.expect("no message sent")) else {
                     panic!("expected text message");
                 };
                 let v: Value = serde_json::from_str(&txt).unwrap();
@@ -12202,12 +12242,12 @@ mod tests {
     mod websocket_connection_failure_reason {
         use super::*;
         use std::io::{Error as IoError, ErrorKind};
-        use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+        use yawc::WebSocketError;
 
         #[test]
-        fn from_tungstenite_error_classifies_connection_closed() {
-            let error = TungsteniteError::ConnectionClosed;
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+        fn from_websocket_error_classifies_connection_closed() {
+            let error = WebSocketError::ConnectionClosed;
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::ConnectionReset
@@ -12216,22 +12256,33 @@ mod tests {
         }
 
         #[test]
-        fn from_tungstenite_error_classifies_already_closed() {
-            let error = TungsteniteError::AlreadyClosed;
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+        fn from_websocket_error_classifies_http_errors() {
+            let error = WebSocketError::InvalidStatusCode(503);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
-                WebsocketConnectionFailureReason::ConnectionReset
+                WebsocketConnectionFailureReason::ServerTemporaryError
             ));
             assert!(reason.should_reconnect());
         }
 
         #[test]
-        fn from_tungstenite_error_classifies_io_errors() {
+        fn from_websocket_error_classifies_configuration_errors() {
+            let error = WebSocketError::FrameTooLarge;
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
+            assert!(matches!(
+                reason,
+                WebsocketConnectionFailureReason::ConfigurationError
+            ));
+            assert!(!reason.should_reconnect());
+        }
+
+        #[test]
+        fn from_websocket_error_classifies_io_errors() {
             // Test ConnectionReset
             let io_error = IoError::new(ErrorKind::ConnectionReset, "connection reset");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::ConnectionReset
@@ -12240,8 +12291,8 @@ mod tests {
 
             // Test ConnectionAborted
             let io_error = IoError::new(ErrorKind::ConnectionAborted, "connection aborted");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::ConnectionReset
@@ -12250,8 +12301,8 @@ mod tests {
 
             // Test TimedOut
             let io_error = IoError::new(ErrorKind::TimedOut, "timed out");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::NetworkInterruption
@@ -12260,8 +12311,8 @@ mod tests {
 
             // Test UnexpectedEof
             let io_error = IoError::new(ErrorKind::UnexpectedEof, "unexpected eof");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::StreamEnded
@@ -12270,8 +12321,8 @@ mod tests {
 
             // Test PermissionDenied
             let io_error = IoError::new(ErrorKind::PermissionDenied, "permission denied");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::AuthenticationFailure
@@ -12280,8 +12331,8 @@ mod tests {
 
             // Test other IO errors default to NetworkInterruption
             let io_error = IoError::other("other error");
-            let error = TungsteniteError::Io(io_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::IoError(io_error);
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::NetworkInterruption
@@ -12290,21 +12341,17 @@ mod tests {
         }
 
         #[test]
-        fn from_tungstenite_error_classifies_protocol_errors() {
-            // Protocol error -> ProtocolViolation
-            use tokio_tungstenite::tungstenite::error::ProtocolError;
-            let protocol_error = ProtocolError::ResetWithoutClosingHandshake;
-            let error = TungsteniteError::Protocol(protocol_error);
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+        fn from_websocket_error_classifies_protocol_errors() {
+            let error = WebSocketError::InvalidCloseFrame;
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
-                WebsocketConnectionFailureReason::UnexpectedClose
+                WebsocketConnectionFailureReason::ProtocolViolation
             ));
-            assert!(reason.should_reconnect());
+            assert!(!reason.should_reconnect());
 
-            // UTF8 error -> ProtocolViolation
-            let error = TungsteniteError::Utf8;
-            let reason = WebsocketConnectionFailureReason::from_tungstenite_error(&error);
+            let error = WebSocketError::InvalidUTF8;
+            let reason = WebsocketConnectionFailureReason::from_websocket_error(&error);
             assert!(matches!(
                 reason,
                 WebsocketConnectionFailureReason::ProtocolViolation

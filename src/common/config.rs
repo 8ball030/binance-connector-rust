@@ -3,13 +3,15 @@ use reqwest::{Client, ClientBuilder};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use tokio_tungstenite::Connector;
+use tokio_rustls::TlsConnector;
+use url::Url;
+use yawc::{HttpRequestBuilder, Options, TcpWebSocket};
 
 use super::models::{ConfigBuildError, TimeUnit, WebsocketMode};
 use super::utils::{SignatureGenerator, build_client};
 
 #[derive(Clone)]
-pub struct AgentConnector(pub Connector);
+pub struct AgentConnector(pub TlsConnector);
 
 impl fmt::Debug for AgentConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,22 +20,12 @@ impl fmt::Debug for AgentConnector {
 }
 
 /// The result produced by a custom [`WebsocketHandshakeFn`]: either the established
-/// WebSocket stream together with the server's HTTP handshake response, or a
-/// `tungstenite` error describing why the handshake could not be completed.
+/// WebSocket, or a `yawc` error describing why the handshake could not be completed.
 ///
-/// This mirrors the return type of
-/// [`tokio_tungstenite::connect_async_tls_with_config`], so an implementation can
-/// simply delegate to it after doing any transport-level setup it needs (see
-/// [`WebsocketHandshakeFn`] for details).
-pub type WebsocketHandshakeResult = Result<
-    (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        tokio_tungstenite::tungstenite::handshake::client::Response,
-    ),
-    tokio_tungstenite::tungstenite::Error,
->;
+/// This mirrors what awaiting [`yawc::WebSocket::connect`] produces, so an
+/// implementation can simply delegate to it after doing any transport-level setup it
+/// needs (see [`WebsocketHandshakeFn`] for details).
+pub type WebsocketHandshakeResult = yawc::Result<TcpWebSocket>;
 
 /// A caller-supplied async function that performs the TLS/WebSocket handshake in
 /// place of the SDK's default connection path.
@@ -47,16 +39,16 @@ pub type WebsocketHandshakeResult = Result<
 ///
 /// # Arguments passed to the function
 ///
-/// The function receives the same inputs that
-/// [`tokio_tungstenite::connect_async_tls_with_config`] takes, so an implementation
-/// can open its own transport and then delegate to that function (or an equivalent)
-/// to finish the handshake:
+/// The function receives what [`yawc::WebSocket::connect`]'s builder takes, so an
+/// implementation can open its own transport and then finish the handshake with
+/// [`yawc::WebSocket::handshake_with_request`], or use the builder's own
+/// `with_proxy` for SOCKS5:
 ///
-/// 1. `Request` — the outgoing HTTP upgrade request (already carries the target URL
-///    and any headers the SDK has set, such as `User-Agent`).
-/// 2. `Option<WebSocketConfig>` — optional WebSocket protocol configuration.
-/// 3. `bool` — whether to disable Nagle's algorithm on the underlying TCP stream.
-/// 4. `Option<Connector>` — the TLS connector derived from the configuration's
+/// 1. `Url` — the target URL.
+/// 2. `HttpRequestBuilder` — the outgoing HTTP upgrade request, already carrying any
+///    headers the SDK has set, such as `User-Agent`.
+/// 3. `Options` — WebSocket protocol configuration.
+/// 4. `Option<TlsConnector>` — the TLS connector derived from the configuration's
 ///    `agent` field, if one was set. A custom handshake function that ignores this
 ///    value effectively overrides `agent`; forward it to the delegate call if the
 ///    two options are meant to compose.
@@ -70,10 +62,10 @@ pub type WebsocketHandshakeResult = Result<
 /// custom handshake function to use as it sees fit.
 pub type WebsocketHandshakeFn = Arc<
     dyn Fn(
-            tokio_tungstenite::tungstenite::handshake::client::Request,
-            Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
-            bool,
-            Option<Connector>,
+            Url,
+            HttpRequestBuilder,
+            Options,
+            Option<TlsConnector>,
         ) -> std::pin::Pin<Box<dyn Future<Output = WebsocketHandshakeResult> + Send>>
         + Send
         + Sync,

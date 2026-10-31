@@ -1,5 +1,5 @@
 use thiserror::Error;
-use tokio_tungstenite::tungstenite::error::ProtocolError;
+use yawc::WebSocketError;
 
 /// Represents different types of WebSocket connection failures and their reconnection eligibility
 #[derive(Debug, Clone, Copy)]
@@ -29,12 +29,15 @@ pub enum WebsocketConnectionFailureReason {
 }
 
 impl WebsocketConnectionFailureReason {
-    /// Classifies a tungstenite error into a failure reason
-    pub fn from_tungstenite_error(error: &tokio_tungstenite::tungstenite::Error) -> Self {
-        use tokio_tungstenite::tungstenite::Error;
+    /// Classifies a WebSocket error into a failure reason
+    #[must_use]
+    // The wildcard stays: yawc adds variants under its own features (`reqwest`,
+    // `http2`), which another crate in the same build may turn on.
+    #[allow(clippy::match_wildcard_for_single_variants)]
+    pub fn from_websocket_error(error: &WebSocketError) -> Self {
         match error {
-            Error::ConnectionClosed | Error::AlreadyClosed => Self::ConnectionReset,
-            Error::Io(io_error) => {
+            WebSocketError::ConnectionClosed => Self::ConnectionReset,
+            WebSocketError::IoError(io_error) => {
                 use std::io::ErrorKind;
                 match io_error.kind() {
                     ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
@@ -45,10 +48,29 @@ impl WebsocketConnectionFailureReason {
                     _ => Self::NetworkInterruption,
                 }
             }
-            Error::Tls(_) | Error::Capacity(_) | Error::Url(_) => Self::ConfigurationError,
-            Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => Self::UnexpectedClose,
-            Error::Protocol(_) | Error::Utf8 | Error::HttpFormat(_) => Self::ProtocolViolation,
-            Error::Http(_) => Self::ServerTemporaryError,
+            WebSocketError::TlsDisabled
+            | WebSocketError::MissingTlsConnector
+            | WebSocketError::FrameTooLarge
+            | WebSocketError::UrlParseError(_)
+            | WebSocketError::InvalidHttpScheme => Self::ConfigurationError,
+            WebSocketError::InvalidFragment
+            | WebSocketError::FragmentTimeout
+            | WebSocketError::InvalidUTF8
+            | WebSocketError::InvalidContinuationFrame
+            | WebSocketError::InvalidUpgradeHeader
+            | WebSocketError::InvalidConnectionHeader
+            | WebSocketError::InvalidCloseFrame
+            | WebSocketError::InvalidCloseCode
+            | WebSocketError::ReservedBitsNotZero
+            | WebSocketError::ControlFrameFragmented
+            | WebSocketError::PingFrameTooLarge
+            | WebSocketError::InvalidSecWebsocketVersion
+            | WebSocketError::InvalidOpCode(_)
+            | WebSocketError::MissingSecWebSocketKey
+            | WebSocketError::CompressionNotSupported => Self::ProtocolViolation,
+            WebSocketError::InvalidStatusCode(_)
+            | WebSocketError::Redirected { .. }
+            | WebSocketError::HTTPError(_) => Self::ServerTemporaryError,
             _ => Self::NetworkInterruption,
         }
     }
