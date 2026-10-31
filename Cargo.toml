@@ -68,7 +68,7 @@ sha2 = "^0.10"
 hex = "^0.4"
 base64 = "^0.22"
 flate2 = "^1.0"
-derive_builder = "^0.10"
+derive_builder = "^0.20"
 tokio-stream = "0.1"
 rand = "0.8"
 futures = "0.3"
@@ -93,12 +93,9 @@ once_cell = "1.21"
   features = [ "serde", "v4" ]
 
   [dependencies.reqwest]
-  version = "^0.12"
-  features = [ "json", "multipart", "blocking" ]
-
-  [dependencies.reqwest-middleware]
-  version = "^0.3"
-  features = [ "json", "multipart" ]
+  version = "^0.13"
+  default-features = false
+  features = [ "json", "multipart", "blocking", "charset", "http2", "system-proxy" ]
 
   [dependencies.tokio]
   version = "^1.33"
@@ -110,7 +107,6 @@ once_cell = "1.21"
 
   [dependencies.tokio-tungstenite]
   version = "0.26"
-  features = [ "native-tls" ]
 
   [dependencies.tokio-util]
   version = "^0.7"
@@ -136,11 +132,11 @@ default = [ "openssl-tls" ]
 openssl-tls = [
   "dep:openssl",
   "dep:tokio-native-tls",
-  "reqwest/default-tls",
+  "reqwest/native-tls",
   "tokio-tungstenite/native-tls"
 ]
 rustls-tls = [
-  "reqwest/rustls-tls",
+  "reqwest/rustls",
   "tokio-tungstenite/rustls-tls-native-roots"
 ]
 algo = [ ]
