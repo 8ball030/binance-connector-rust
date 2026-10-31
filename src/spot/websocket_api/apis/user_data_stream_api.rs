@@ -295,15 +295,15 @@ mod tests {
     use tokio::spawn;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio::time::{Duration, timeout};
-    use tokio_tungstenite::tungstenite::Message;
+    use yawc::{Frame, OpCode};
 
     async fn setup() -> (
         Arc<WebsocketApi>,
         Arc<WebsocketConnection>,
-        UnboundedReceiver<Message>,
+        UnboundedReceiver<Frame>,
     ) {
         let conn = WebsocketConnection::new("test-conn");
-        let (tx, rx) = unbounded_channel::<Message>();
+        let (tx, rx) = unbounded_channel::<Frame>();
         {
             let mut conn_state = conn.state.lock().await;
             conn_state.ws_write_tx = Some(tx);
@@ -334,7 +334,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.expect("send should occur").expect("channel closed");
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap();
             assert_eq!(v["method"], "/session.subscriptions".trim_start_matches('/'));
@@ -377,7 +378,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap().to_string();
 
@@ -430,9 +432,10 @@ mod tests {
                 .await
                 .expect("send should occur")
                 .expect("channel closed");
-            let Message::Text(text) = sent else {
+            let OpCode::Text = sent.opcode() else {
                 panic!("expected Message Text")
             };
+            let text = sent.as_str();
 
             let _: Value = serde_json::from_str(&text).unwrap();
 
@@ -462,7 +465,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.expect("send should occur").expect("channel closed");
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap();
             assert_eq!(v["method"], "/userDataStream.subscribe".trim_start_matches('/'));
@@ -505,7 +509,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap().to_string();
 
@@ -558,9 +563,10 @@ mod tests {
                 .await
                 .expect("send should occur")
                 .expect("channel closed");
-            let Message::Text(text) = sent else {
+            let OpCode::Text = sent.opcode() else {
                 panic!("expected Message Text")
             };
+            let text = sent.as_str();
 
             let _: Value = serde_json::from_str(&text).unwrap();
 
@@ -590,7 +596,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.expect("send should occur").expect("channel closed");
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap();
             assert_eq!(v["method"], "/userDataStream.subscribe.signature".trim_start_matches('/'));
@@ -633,7 +640,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap().to_string();
 
@@ -688,9 +696,10 @@ mod tests {
                 .await
                 .expect("send should occur")
                 .expect("channel closed");
-            let Message::Text(text) = sent else {
+            let OpCode::Text = sent.opcode() else {
                 panic!("expected Message Text")
             };
+            let text = sent.as_str();
 
             let _: Value = serde_json::from_str(&text).unwrap();
 
@@ -723,7 +732,10 @@ mod tests {
                 .await
                 .expect("send should occur")
                 .expect("channel closed");
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else {
+                panic!()
+            };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap();
             assert_eq!(
@@ -782,7 +794,8 @@ mod tests {
             });
 
             let sent = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-            let Message::Text(text) = sent else { panic!() };
+            let OpCode::Text = sent.opcode() else { panic!() };
+            let text = sent.as_str();
             let v: Value = serde_json::from_str(&text).unwrap();
             let id = v["id"].as_str().unwrap().to_string();
 
@@ -835,9 +848,10 @@ mod tests {
                 .await
                 .expect("send should occur")
                 .expect("channel closed");
-            let Message::Text(text) = sent else {
+            let OpCode::Text = sent.opcode() else {
                 panic!("expected Message Text")
             };
+            let text = sent.as_str();
 
             let _: Value = serde_json::from_str(&text).unwrap();
 
